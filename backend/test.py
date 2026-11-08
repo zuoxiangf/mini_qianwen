@@ -1,18 +1,13 @@
-# check_env.py
+# 临时执行一次，删掉旧的 kb 集合
 import os
-from openai import OpenAI
+from pathlib import Path
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
 
-KEY = "sk-ws-H.YLHHMIP.sbvu.MEUCIQDdP3x1ddPEgYL7wdUBceD79Gu8wrQHWghXqzU0g2ObhQIgVSknmOa9BZUadX6bQ4yliCfQAKPR_-xbGdkTxTCpj4I"
-BASE = os.environ.get("BASE_URL", "https://maas.qianwenaiapi.com/compatible-mode/v1")
+# ★ 锚定到本文件所在目录，无论从哪里运行都能找到 backend/.env
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
-
-
-client = OpenAI(api_key=KEY, base_url=BASE, timeout=30)
-r = client.chat.completions.create(
-    model="qwen3.6-flash",
-    messages=[{"role":"user","content":"只回两个字：收到"}],
-    temperature=0,
-)
-
-print("model:", r.model)
-print("reply:", r.choices[0].message.content)
+# Deleted:load_dotenv(Path("backend/.env"))
+c = QdrantClient(path=os.environ["QDRANT_PATH"])
+c.delete_collection("kb")
+print("kb 集合已删除，下次上传会按 1024 维重建")
