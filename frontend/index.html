@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mini Qwen</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Mini Qwen</h1>
+    <div class="tabs">
+      <button class="tab active" data-mode="chat">💬 闲聊</button>
+      <button class="tab" data-mode="ask">❓ 单轮问答</button>
+    </div>
+    <button id="btnNew" class="ghost">＋ 新对话</button>
+  </header>
+
+  <div id="list" class="list"></div>
+
+  <footer>
+    <textarea id="input" rows="2" placeholder="输入消息…"></textarea>
+    <div class="actions">
+      <span id="hint" class="hint">闲聊模式：会记住上下文</span>
+      <button id="btnSend">发送</button>
+      <button id="btnStop" class="danger" hidden>停止</button>
+    </div>
+  </footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
