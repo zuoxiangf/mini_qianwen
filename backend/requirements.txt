@@ -3,6 +3,17 @@ uvicorn[standard]
 openai
 dashscope
 qdrant-client
-sqlalchemy
+# ★ 必须带 [asyncio] extra：异步引擎隐式依赖 greenlet，裸写 sqlalchemy 会在容器内启动崩溃（曾有 502 事故）
+sqlalchemy[asyncio]
 aiomysql
 python-dotenv
+python-multipart
+# 知识库多格式解析 / 编码嗅探 / 网页抓取
+pypdf
+python-docx
+beautifulsoup4
+charset-normalizer
+httpx
+# 鉴权：JWT 签发/校验 + bcrypt 密码哈希
+PyJWT
+bcrypt

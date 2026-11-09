@@ -62,9 +62,17 @@ def _pid(id_str: str) -> str:
 
 
 def _ensure_collection():
-    """确保目标集合存在：不存在则按 EMBED_DIM 维度 + COSINE 相似度创建。"""
+    """确保目标集合存在：不存在则按 EMBED_DIM 维度 + COSINE 相似度创建。
+
+    已存在时校对维度：换 embedding 模型后维度一变，旧集合上的 upsert/query 会直接报错，
+    把不一致先记成一条日志，比在上层调用链里碰到 500 好定位。
+    """
     _qdrant = _get_client()
     if _qdrant.collection_exists(COLLECTION):
+        dim = _qdrant.get_collection(COLLECTION).config.params.vectors.size
+        if dim != EMBED_DIM:
+            log.error("集合维度与当前模型不一致！| collection=%s | 已存=%d | 期望=%d（模型=%s）",
+                      COLLECTION, dim, EMBED_DIM, EMB_MODEL)
         log.debug("集合已存在，跳过创建 | collection=%s", COLLECTION)
         return
     log.info("创建新集合 | collection=%s | dim=%d | metric=COSINE", COLLECTION, EMBED_DIM)
@@ -129,12 +137,13 @@ async def add_docs(docs: list[str], ids: list[str]):
     log.info("文档入库完成 | collection=%s | 写入点数=%d", COLLECTION, len(points))
 
 
-async def retrieve(query: str, k: int = 4, score_threshold: float | None = None) -> list[str]:
-    """检索与 query 最相似的 Top-K 文本块。
+async def retrieve(query: str, k: int = 4, score_threshold: float | None = None) -> list[dict]:
+    """检索与 query 最相似的 Top-K 文本块，返回 [{"id": 来源标识, "text": 正文}, ...]。
     - 集合不存在（还没灌过库）时优雅返回空列表；
-    - score_threshold 给定时，低于该相似度的结果会被过滤掉。"""
+    - score_threshold 给定时，低于该相似度的结果会被过滤掉；
+    - id 为入库时的 '文件名#块号'，用于向用户透出答案依据。"""
     _qdrant = _get_client()
-    if not _qdrant.collection_exists(COLLECTION):
+    if not await asyncio.to_thread(_qdrant.collection_exists, COLLECTION):
         log.info("检索跳过：集合不存在（知识库尚未入库）| collection=%s", COLLECTION)
         return []
     log.info("开始检索 | query=%r | k=%d | threshold=%s", query[:50], k, score_threshold)
@@ -147,9 +156,12 @@ async def retrieve(query: str, k: int = 4, score_threshold: float | None = None)
         score_threshold=score_threshold,
         with_payload=True,
     )
-    texts = [p.payload["text"] for p in res.points]
-    log.info("检索完成 | 命中 %d 条", len(texts))
-    return texts
+    hits = [{"id": (p.payload or {}).get("id", "未知来源"),
+             "text": (p.payload or {}).get("text", "")} for p in res.points]
+    # 记一次相似度分布，便于据此选定 KB_SCORE_THRESHOLD
+    log.info("检索完成 | 命中 %d 条 | 来源=%s", len(hits), [h["id"] for h in hits])
+    log.info("检索得分 | %s", [round(p.score, 4) if p.score is not None else None for p in res.points])
+    return hits
 
 
 

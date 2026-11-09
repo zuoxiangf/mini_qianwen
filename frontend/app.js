@@ -7,6 +7,10 @@ let mode = "chat";          // 当前模式：chat（闲聊，带上下文）| a
 let sessionId = null;       // 闲聊会话 ID，由后端通过 X-Session-Id 响应头返回
 let aborter = null;         // 当前请求的 AbortController，用于停止生成
 
+// ---------- 鉴权状态：JWT 存在 localStorage，请求携 Authorization: Bearer ----------
+let token = localStorage.getItem("token") || null;   // 登录凭证
+let authMode = "login";                               // 登录门当前页签：login | register
+
 // 页面核心 DOM 元素引用
 
 const $list  = document.getElementById("list");
@@ -15,6 +19,105 @@ const $send  = document.getElementById("btnSend");
 const $stop  = document.getElementById("btnStop");
 const $hint  = document.getElementById("hint");
 const $newBtn = document.getElementById("btnNew");
+const $app = document.getElementById("app");
+const $gate = document.getElementById("authGate");
+const $curUser = document.getElementById("curUser");
+const $authUser = document.getElementById("authUser");
+const $authPass = document.getElementById("authPass");
+const $authMsg = document.getElementById("authMsg");
+const $authSubmit = document.getElementById("authSubmit");
+
+// ---------- 鉴权辅助 ----------
+/** 所有需鉴权的请求统一使用；带 Content-Type 与 Authorization 头 */
+function authHeaders(extra) {
+  return Object.assign(
+    { "Content-Type": "application/json" },
+    token ? { "Authorization": "Bearer " + token } : {},
+    extra || {},
+  );
+}
+
+/** 切换登录门 / 主界面显示 */
+function showGate() {
+  $gate.hidden = false;
+  $app.hidden = true;
+  $authPass.value = "";
+}
+function showApp(username) {
+  $gate.hidden = true;
+  $app.hidden = false;
+  $curUser.textContent = username ? ("👤 " + username) : "";
+  $input.focus();
+}
+
+/** 登出：清除本地 token 并回到登录门 */
+function logout() {
+  token = null;
+  localStorage.removeItem("token");
+  sessionId = null;
+  $list.innerHTML = "";
+  showGate();
+}
+document.getElementById("btnLogout").addEventListener("click", logout);
+
+// 登录 / 注册页签切换
+document.querySelectorAll(".auth-tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelector(".auth-tab.active").classList.remove("active");
+    btn.classList.add("active");
+    authMode = btn.dataset.auth;
+    $authSubmit.textContent = authMode === "login" ? "登录" : "注册";
+    $authPass.autocomplete = authMode === "login" ? "current-password" : "new-password";
+    $authMsg.textContent = "";
+  });
+});
+
+// 提交登录/注册
+document.getElementById("authForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const username = $authUser.value.trim();
+  const password = $authPass.value;
+  if (!username || !password) { $authMsg.textContent = "请填写用户名和密码"; return; }
+  $authSubmit.disabled = true;
+  $authMsg.textContent = "";
+  try {
+    const res = await fetch(`${API}/api/auth/${authMode}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      $authMsg.textContent = data.detail || `请求失败 (${res.status})`;
+      return;
+    }
+    token = data.token;
+    localStorage.setItem("token", token);
+    showApp(data.username);
+  } catch (err) {
+    $authMsg.textContent = "网络错误：" + err.message;
+  } finally {
+    $authSubmit.disabled = false;
+  }
+});
+
+// 启动：持 token 则校验有效性（/api/auth/me），否则弹登录门
+(async function init() {
+  if (!token) { showGate(); return; }
+  try {
+    const res = await fetch(`${API}/api/auth/me`, { headers: authHeaders() });
+    if (res.ok) {
+      const me = await res.json();
+      showApp(me.username);
+    } else {
+      if (res.status === 401) localStorage.removeItem("token");
+      token = null;
+      showGate();
+    }
+  } catch (_) {
+    showGate();   // 网络异常时也先展示登录门
+  }
+})();
 
 // Tab 切换：在闲聊模式与单轮问答模式之间切换，切换时更新提示文案并清空上下文
 // 使用场景：用户点击页面顶部的模式切换按钮时触发
@@ -46,16 +149,38 @@ $stop.addEventListener("click", () => aborter?.abort());
  * @param {string} role - 消息角色："user"（用户）| "ai"（助手）| "system"（系统提示）
  * @param {string} text - 消息文本内容
  * @returns {HTMLElement} 新创建的消息元素，便于后续流式更新其文本内容
+ * 注：ai 气泡的正文放在内部 <span> 里，来源条（.sources）作为兄弟节点共存，
+ *     避免流式更新 textContent 时误删已插入的来源 DOM。
  * 使用场景：发送消息时插入用户气泡，收到响应前创建空的 AI 气泡供流式填充
  */
 function append(role, text) {
   const div = document.createElement("div");
   div.className = "msg " + role;
-  if (role !== "system") div.textContent = text;
-  else div.textContent = text;
+  if (role === "system") div.textContent = text;
+  else {
+    const span = document.createElement("span");
+    span.textContent = text;
+    div.appendChild(span);
+  }
   $list.appendChild(div);
   $list.scrollTop = $list.scrollHeight;
   return div;
+}
+
+/** 取气泡里存放正文的 span（ai 气泡专用） */
+function bodyOf(box) { return box.querySelector("span"); }
+
+/**
+ * 在 AI 气泡顶部渲染 RAG 参考来源列表
+ * @param {HTMLElement} box - 当前 AI 消息气泡
+ * @param {string[]} sources - 来源标识数组（文件名#块号）
+ * 使用场景：单轮问答命中知识库资料时，后端在正文前下发 sources 事件
+ */
+function renderSources(box, sources) {
+  const ref = document.createElement("div");
+  ref.className = "sources";
+  ref.textContent = "📄 参考：" + sources.join("、");
+  box.insertBefore(ref, box.firstChild);
 }
 
 /**
@@ -92,18 +217,18 @@ async function send() {
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body,
       signal: controller.signal,
     });
     // 后端可能在新建会话后返回会话 ID，需记录以便后续请求携带
-    console.log("Session ID before:", res)
     sessionId = res.headers.get("X-Session-Id") || sessionId;
-    console.log("Session ID:", sessionId)
-    // 非 2xx 响应：展示错误状态码与详情，终止本次流程
+    // 会话已过期/失效：清除本地凭证并回到登录门
+    if (res.status === 401) { logout(); return; }
+    // 其余非 2xx 响应：展示错误状态码与详情，终止本次流程
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      aiBox.textContent = `请求失败 (${res.status})：${err.detail || res.statusText}`;
+      bodyOf(aiBox).textContent = `请求失败 (${res.status})：${err.detail || res.statusText}`;
       return;
     }
 
@@ -126,16 +251,17 @@ async function send() {
         if (data === "[DONE]") continue;         // 流结束标记，无需处理
         try {
           const obj = JSON.parse(data);
-          if (obj.error) { aiBox.textContent += `\n[错误] ${obj.error}`; continue; }
-          if (obj.content) { content += obj.content; aiBox.textContent = content; $list.scrollTop = $list.scrollHeight; }
+          if (obj.error) { bodyOf(aiBox).textContent += `\n[错误] ${obj.error}`; continue; }
+          if (obj.sources) { renderSources(aiBox, obj.sources); continue; }   // RAG 来源列表，先于正文下发
+          if (obj.content) { content += obj.content; bodyOf(aiBox).textContent = content; $list.scrollTop = $list.scrollHeight; }
           // reasoning 字段可留到 v1.1 再展示
         } catch (_) {}
       }
     }
   } catch (e) {
     // 区分用户主动停止（AbortError，保留已生成内容）与真正的网络异常
-    if (e.name !== "AbortError") aiBox.textContent = "网络错误：" + e.message;
-    else aiBox.textContent += "\n[已停止]";
+    if (e.name !== "AbortError") bodyOf(aiBox).textContent = "网络错误：" + e.message;
+    else bodyOf(aiBox).textContent += "\n[已停止]";
   } finally {
     // 无论成功、失败或中断，均恢复输入与按钮状态，并将焦点还给输入框
     $input.disabled = false;
