@@ -269,6 +269,87 @@ sudo nginx -t && sudo systemctl reload nginx
 - **已有数据库升级**（init.sql 只对新装生效）：手动执行 init.sql 尾部注释里的
   `ALTER TABLE sessions ADD COLUMN uid ...` 等语句。
 
+### 6.3 服务器日常操作命令速查
+
+以下命令均在**服务器**的项目根目录（即 `docker-compose.yml` 所在目录）执行。
+
+**① 改了后端代码（含 `requirements.txt`）后的更新流程：**
+
+```bash
+git pull                                        # 拉取本地 push 的新代码
+docker compose --env-file .env.prod up -d --build --force-recreate backend
+#   ▲ --build 必带：镜像不重建，容器里还是旧代码/旧依赖
+#   ▲ 只动 backend 一个服务，mysql / qdrant 容器不受影响，数据不丢
+
+docker compose logs --tail 50 backend           # 确认无 ImportError，出现“服务启动 | CHAT=...”日志
+docker compose ps                               # 三个服务都应为 Up / healthy
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/docs   # 应返回 200
+```
+
+**② 改了前端代码后的更新流程（前端是静态文件，不涉及容器）：**
+
+```bash
+git pull
+sudo cp -r frontend/* /var/www/mini_qianwen/    # 同步静态文件到 Nginx 目录
+# 无需 reload nginx，浏览器强制刷新（Ctrl+F5）即可看到新版本
+```
+
+**③ 改了 `deploy/nginx-site.conf` 后的更新流程：**
+
+```bash
+git pull
+sudo cp deploy/nginx-site.conf /etc/nginx/sites-available/mini_qianwen
+sudo nginx -t                                   # ★ 先测配置，语法错不能 reload
+sudo systemctl reload nginx                     # 平滑生效，不断开已有连接
+```
+
+**④ 改了 `.env.prod`（如换模型、改 JWT_SECRET）后的更新流程：**
+
+```bash
+vim .env.prod                                   # 此文件不在 git 里，直接在服务器上改
+docker compose --env-file .env.prod up -d --force-recreate backend
+#   ▲ 只重建容器不重建镜像（代码没变时可省 --build），环境变量会重新注入
+docker compose logs --tail 20 backend           # 确认新配置生效（看“服务启动”日志行）
+```
+
+**⑤ 改了 `deploy/init.sql` 后的注意**：它对**已存在**的 mysql 数据卷不生效，
+必须手动进容器执行 SQL：
+
+```bash
+docker compose exec mysql mysql -uroot -p bp_local    # 建表/ALTER 语句手动粘贴执行
+```
+
+**⑥ 日常查看状态与日志：**
+
+```bash
+docker compose ps                               # 服务状态（Restarting = 启动即崩，查 ⑦）
+docker compose logs -f backend                  # 实时跟踪后端日志（Ctrl+C 退出）
+docker compose logs --tail 100 mysql            # 数据库日志
+```
+
+**⑦ 故障恢复：**
+
+```bash
+# 接口 502：分层排查 —— 先看容器是否崩了，再看首行报错
+docker compose ps && docker compose logs --tail 50 backend
+# 修复代码后回到 ① 的流程
+
+# 彻底重启全部服务（数据在 volume 里，不会丢）
+docker compose --env-file .env.prod down
+docker compose --env-file .env.prod up -d
+
+# ⚠️ 切勿随意使用 down -v：会删除 mysql_data / qdrant_data 数据卷，
+#    会话历史和知识库向量全部丢失，仅在重装且已 mysqldump 备份后才可用
+```
+
+**完整更新速记（前后端都改了）：**
+
+```bash
+git pull \
+&& docker compose --env-file .env.prod up -d --build --force-recreate backend \
+&& sudo cp -r frontend/* /var/www/mini_qianwen/
+```
+
 ---
 
 ## 7. 本地开发启动

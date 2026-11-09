@@ -50,6 +50,23 @@ function showApp(username) {
   $input.focus();
 }
 
+/** 统一提取后端错误信息：兼容字符串 detail 与 Pydantic 422 校验错误的数组 detail，
+    否则数组被直接赋给 textContent 会显示成 [object Object] */
+function extractError(data, status) {
+  const d = data && data.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d) && d.length) {
+    const first = d[0];
+    const field = (first.loc || []).slice(-1)[0];          // loc 末位是字段名，如 "username"
+    const msg = first.msg || "参数不合法";
+    if (first.type === "string_too_short" && /at least (\d+)/.test(msg)) {
+      return `${field || "字段"}太短，至少需要 ${RegExp.$1} 个字符`;
+    }
+    return (field ? field + ": " : "") + msg;
+  }
+  return `请求失败 (${status})`;
+}
+
 /** 登出：清除本地 token 并回到登录门 */
 function logout() {
   token = null;
@@ -78,6 +95,8 @@ document.getElementById("authForm").addEventListener("submit", async (e) => {
   const username = $authUser.value.trim();
   const password = $authPass.value;
   if (!username || !password) { $authMsg.textContent = "请填写用户名和密码"; return; }
+  if (username.length < 3) { $authMsg.textContent = "用户名至少 3 个字符"; return; }
+  if (password.length < 6) { $authMsg.textContent = "密码至少 6 位"; return; }
   $authSubmit.disabled = true;
   $authMsg.textContent = "";
   try {
@@ -88,7 +107,7 @@ document.getElementById("authForm").addEventListener("submit", async (e) => {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      $authMsg.textContent = data.detail || `请求失败 (${res.status})`;
+      $authMsg.textContent = extractError(data, res.status);
       return;
     }
     token = data.token;
@@ -228,7 +247,7 @@ async function send() {
     // 其余非 2xx 响应：展示错误状态码与详情，终止本次流程
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      bodyOf(aiBox).textContent = `请求失败 (${res.status})：${err.detail || res.statusText}`;
+      bodyOf(aiBox).textContent = extractError(err, res.status);
       return;
     }
 
