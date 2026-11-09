@@ -1,5 +1,7 @@
-// 后端 API 服务地址
-const API = "http://localhost:8000";
+// 后端 API 服务地址：本地开发（file:// 或 localhost/127.0.0.1）直连 8000；线上按 IP/域名访问，与页面同域由 Nginx 反代 /api/
+const API = location.protocol === "file:" || ["localhost", "127.0.0.1"].includes(location.hostname)
+  ? "http://localhost:8000"
+  : "";
 
 let mode = "chat";          // 当前模式：chat（闲聊，带上下文）| ask（单轮问答，无历史）
 let sessionId = null;       // 闲聊会话 ID，由后端通过 X-Session-Id 响应头返回

@@ -1,0 +1,6 @@
+# 构建镜像时排除：密钥、缓存与本地数据绝不进镜像层
+.env
+__pycache__/
+*.pyc
+qdrant_data/
+test*.py

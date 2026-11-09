@@ -29,6 +29,8 @@ BASE_URL = os.environ.get("BASE_URL", "https://maas.qianwenaiapi.com/compatible-
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "deepseek-v4-pro-0813")
 QA_MODEL = os.environ.get("QA_MODEL", "deepseek-v4-pro-0813")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "10"))
+# CORS 白名单：逗号分隔的前端来源，如 http://1.2.3.4:8080；留空则退回 *（仅限本地开发）
+FRONTEND_ORIGINS = [o.strip() for o in os.environ.get("FRONTEND_ORIGINS", "").split(",") if o.strip()]
 
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=90)
 
@@ -53,7 +55,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MiniQwen", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # 生产环境收敛到具体域名
+    allow_origins=FRONTEND_ORIGINS or ["*"],  # 生产在 .env 配 FRONTEND_ORIGINS 收敛白名单
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

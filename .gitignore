@@ -1,0 +1,14 @@
+# 密钥与生产配置：绝不进 git
+.env
+.env.prod
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 本地向量数据（生产用 qdrant 容器 volume）
+backend/qdrant_data/
+
+# IDE
+.idea/
