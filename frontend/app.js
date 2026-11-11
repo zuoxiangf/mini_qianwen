@@ -202,6 +202,33 @@ function renderSources(box, sources) {
   box.insertBefore(ref, box.firstChild);
 }
 
+// 工具名 → 用户可读的中文提示（后端 SSE 下发 {"tool": {name, args}} 事件时使用）
+const TOOL_LABELS = {
+  get_weather: "🌤️ 正在查天气",
+  get_user_info: "👤 正在查用户信息",
+  search_chat_history: "🔍 正在检索历史对话",
+};
+
+/**
+ * 在 AI 气泡顶部渲染一条“正在调用工具”提示行
+ * @param {HTMLElement} box - 当前 AI 消息气泡
+ * @param {{name: string, args: string}} tool - 工具名与模型生成的参数 JSON 串
+ * 使用场景：闲聊模式下模型触发 Function Calling，后端在执行工具前先下发 tool 事件，
+ * 避免用户等待天气/数据库查询时看不到任何反馈
+ */
+function renderToolCall(box, tool) {
+  const div = document.createElement("div");
+  div.className = "tool-call";
+  div.textContent = TOOL_LABELS[tool.name] || ("🔧 正在调用工具：" + tool.name);
+  // 从参数 JSON 里挑一个最有信息量的字段展示（查不了就不显示）
+  try {
+    const a = JSON.parse(tool.args || "{}");
+    const brief = a.city || a.keyword || a.username;
+    if (brief) div.textContent += " · " + brief;
+  } catch (_) {}
+  box.insertBefore(div, box.firstChild);
+}
+
 /**
  * 发送用户消息并流式接收 AI 回复（核心交互函数）
  * 处理流程：
@@ -272,6 +299,7 @@ async function send() {
           const obj = JSON.parse(data);
           if (obj.error) { bodyOf(aiBox).textContent += `\n[错误] ${obj.error}`; continue; }
           if (obj.sources) { renderSources(aiBox, obj.sources); continue; }   // RAG 来源列表，先于正文下发
+          if (obj.tool) { renderToolCall(aiBox, obj.tool); continue; }       // 工具调用提示（Function Calling）
           if (obj.content) { content += obj.content; bodyOf(aiBox).textContent = content; $list.scrollTop = $list.scrollHeight; }
           // reasoning 字段可留到 v1.1 再展示
         } catch (_) {}

@@ -17,3 +17,6 @@ httpx
 # 鉴权：JWT 签发/校验 + bcrypt 密码哈希
 PyJWT
 bcrypt
+# 混合检索：BM25 关键字检索 + jieba 中文分词
+rank-bm25
+jieba

@@ -164,6 +164,38 @@ async def retrieve(query: str, k: int = 4, score_threshold: float | None = None)
     return hits
 
 
+def _rrf_merge(vec_hits: list[dict], kw_hits: list[dict], k: int, c: int = 60) -> list[dict]:
+    """Reciprocal Rank Fusion：score = Σ 1/(c + rank)。
+    - 只依赖排名不依赖原始分数，天然规避 cosine(0~1) 与 BM25(无上界) 的量纲差异；
+    - c=60 为经验平滑常数，避免头部排名权重过分悬殊；
+    - 同一块在两路都靠前时总分最高，最终按融合分取 Top-k。"""
+    fused: dict[str, float] = {}
+    ref: dict[str, dict] = {}
+    for hits in (vec_hits, kw_hits):
+        for rank, h in enumerate(hits):
+            key = h["id"]
+            fused[key] = fused.get(key, 0.0) + 1.0 / (c + rank + 1)
+            ref.setdefault(key, h)
+    ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:k]
+    return [ref[i] for i, _ in ranked]
+
+
+async def hybrid_retrieve(query: str, k: int = 4,
+                          score_threshold: float | None = None) -> list[dict]:
+    """混合检索：向量 Top-N + BM25 Top-N，RRF 融合后取 Top-k。
+    - 每路各取 k*2 再融合，给重排序留出重组空间；
+    - 向量通路精确匹配靠语义，关键字通路兜住型号/错误码等低频专有名词；
+    - score_threshold 仅作用于向量路，BM25 命中不受其约束（正是混合想要的效果）；
+    - bm25 延迟 import：bm25.py 依赖本模块，函数内导入避免循环依赖。"""
+    import bm25
+    vec_task = retrieve(query, k=k * 2, score_threshold=score_threshold)
+    kw_task = asyncio.to_thread(bm25.search, query, k * 2)
+    vec_hits, kw_hits = await asyncio.gather(vec_task, kw_task)
+    merged = _rrf_merge(vec_hits, kw_hits, k=k)
+    log.info("混合检索 | 向量命中=%d | 关键字命中=%d | 融合后=%d", len(vec_hits), len(kw_hits), len(merged))
+    return merged
+
+
 
 
 

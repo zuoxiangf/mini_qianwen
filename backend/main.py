@@ -23,8 +23,10 @@ from db import (                                       # noqa: E402  MySQL 会�
     list_sessions as db_list_sessions, get_session_owner,
     create_user, get_user_by_username,
 )
-from vector import retrieve, add_docs            # noqa: E402  向量检索 / 入库
+from vector import retrieve, add_docs, hybrid_retrieve            # noqa: E402  向量检索 / 入库 / 混合检索
+import bm25                                                   # noqa: E402  关键字索引（复用 vector 的客户端，无锁冲突）
 from extract import extract_text                 # noqa: E402  PDF/DOCX/文本编码嗅探
+from tools import TOOL_SCHEMAS, execute_tool        # noqa: E402  Function Calling 工具层
 from auth import (                               # noqa: E402  密码哈希 / JWT / 当前用户依赖
     hash_password, verify_password, create_token, get_current_user,
     USERNAME_MIN, USERNAME_MAX, PASSWORD_MIN,
@@ -45,14 +47,23 @@ MAX_UPLOAD_MB = int(os.environ.get("KB_MAX_UPLOAD_MB", "20"))
 # 建议先设 0.2~0.35 观察命中分布，过低会把不相关内容也塞进上下文
 KB_SCORE_THRESHOLD = os.environ.get("KB_SCORE_THRESHOLD", "").strip()
 KB_SCORE_THRESHOLD = float(KB_SCORE_THRESHOLD) if KB_SCORE_THRESHOLD else None
+# 检索模式开关：hybrid（向量+关键字融合，默认）/ vector（纯向量）/ bm25（纯关键字），便于 A/B 对比效果
+RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "hybrid").strip().lower()
 # CORS 白名单：逗号分隔的前端来源，如 http://1.2.3.4:8080；留空则退回 *（仅限本地开发）
 FRONTEND_ORIGINS = [o.strip() for o in os.environ.get("FRONTEND_ORIGINS", "").split(",") if o.strip()]
+# Function Calling 开关：网关/模型不支持 tools 参数时可置 0 快速回退纯闲聊
+ENABLE_TOOLS = os.environ.get("ENABLE_TOOLS", "1").strip() == "1"
+# 单轮对话最多允许几轮工具调用；最后一轮会去掉 tools 强制模型文字收尾，防死循环
+MAX_TOOL_ROUNDS = max(1, int(os.environ.get("MAX_TOOL_ROUNDS", "4")))
 
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=90)
 
 SYSTEM_CHAT = """你是千问小助手，一个友好、幽默、乐于助人的 AI 伙伴。
 要求：回答简洁自然，像真人聊天；不知道的事直接承认，不编造；
-单次回复尽量控制在 500 字以内，除非用户要求详细展开。"""
+单次回复尽量控制在 500 字以内，除非用户要求详细展开。
+你可以调用工具获取实时信息：查天气用 get_weather，查账号资料用 get_user_info，
+检索用户过往对话用 search_chat_history。需要时先调工具再作答，不要臆造数据；
+工具返回失败时，如实告知用户而不是编造结果。"""
 
 SYSTEM_QA = """你是一个严谨的问答助手。请针对用户的当次提问给出准确、结构清晰的回答。
 要求：分点作答、有依据；不确定的内容明确标注；不主动延伸话题。"""
@@ -60,7 +71,12 @@ SYSTEM_QA = """你是一个严谨的问答助手。请针对用户的当次提�
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("服务启动 | CHAT=%s QA=%s", CHAT_MODEL, QA_MODEL)
+    log.info("服务启动 | CHAT=%s QA=%s | 检索模式=%s", CHAT_MODEL, QA_MODEL, RETRIEVAL_MODE)
+    # 从 Qdrant payload 全量重建内存 BM25 索引（向量检索无需预热，随时可用）
+    try:
+        await bm25.load_from_qdrant()
+    except Exception:
+        log.exception("BM25 索引启动加载失败，混合检索将退化为纯向量")
     yield
     log.info("服务关闭")
 
@@ -141,6 +157,74 @@ async def _stream_to_browser(stream, on_complete=None, pre_events=None):
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except Exception as e:
         log.exception("转发流失败")
+        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+    finally:
+        if on_complete and collected:
+            await on_complete("".join(collected))         # ★ 流结束后持久化 AI 回复
+        yield "data: [DONE]\n\n"
+
+
+async def _chat_sse(initial_stream, msgs: list[dict], ctx: dict, on_complete=None):
+    """带 Function Calling 循环的闲聊 SSE 生成器（兼容 stream=True 的工具调用分片）。
+
+    每轮：content 增量直接下发浏览器，tool_calls 增量按 index 拼接（name/arguments
+    会分散在多个 chunk）；轮末若存在工具调用——下发 {"tool": ...} 事件供前端展示，
+    执行后按 OpenAI 协议把 assistant(tool_calls) 与 tool 结果回填 msgs，再发起下一轮。
+    达到 MAX_TOOL_ROUNDS 后不再传 tools，强制模型基于已有结果文字收尾，防死循环。
+    首轮请求已由调用方建立（失败可正常返回 HTTP 状态码），后续轮异常走 SSE error 事件。
+    """
+    stream = initial_stream
+    collected: list[str] = []
+    try:
+        for round_i in range(MAX_TOOL_ROUNDS + 1):
+            tool_calls: dict[int, dict] = {}              # index -> {id, name, args}
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                payload = {}
+                if delta.content:
+                    payload["content"] = delta.content
+                    collected.append(delta.content)
+                if getattr(delta, "reasoning_content", None):
+                    payload["reasoning"] = delta.reasoning_content
+                for tc in delta.tool_calls or []:
+                    slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        slot["name"] += tc.function.name
+                    if tc.function and tc.function.arguments:
+                        slot["args"] += tc.function.arguments
+                if payload:
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            if not tool_calls:
+                break                                     # 本轮无工具调用 → 回答完成
+            calls = [tool_calls[i] for i in sorted(tool_calls)]
+            msgs.append({"role": "assistant", "content": None, "tool_calls": [
+                {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["args"]}}
+                for c in calls]})
+            for c in calls:
+                log.info("工具调用 | sid=%s | 轮=%d | %s(%s)", ctx["sid"], round_i + 1, c["name"], c["args"])
+                yield f"data: {json.dumps({'tool': {'name': c['name'], 'args': c['args']}}, ensure_ascii=False)}\n\n"
+                result = await execute_tool(c["name"], c["args"], ctx)
+                msgs.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+            # 发起下一轮；到达末轮不再传 tools，强制模型给出最终文字回答
+            kwargs = dict(model=CHAT_MODEL, messages=msgs,
+                          temperature=0.7, max_tokens=1024, stream=True)
+            if ENABLE_TOOLS and round_i + 1 < MAX_TOOL_ROUNDS:
+                kwargs["tools"] = TOOL_SCHEMAS
+            elif round_i + 1 >= MAX_TOOL_ROUNDS:
+                log.warning("工具调用达轮次上限，本轮强制收尾 | sid=%s | 轮=%d", ctx["sid"], round_i + 1)
+            stream = await client.chat.completions.create(**kwargs)
+    except APIStatusError as e:
+        log.warning("闲聊模型返回状态错误 | sid=%s | status=%d", ctx["sid"], e.status_code)
+        yield f"data: {json.dumps({'error': f'模型错误：{e}'}, ensure_ascii=False)}\n\n"
+    except APITimeoutError:
+        log.error("闲聊模型响应超时 | sid=%s", ctx["sid"])
+        yield f"data: {json.dumps({'error': '模型响应超时'}, ensure_ascii=False)}\n\n"
+    except Exception as e:
+        log.exception("转发闲聊流失败")
         yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
     finally:
         if on_complete and collected:
@@ -259,6 +343,11 @@ async def _ingest_text(text: str, source: str) -> dict:
     except Exception as e:
         log.exception("知识库入库失败 | 来源=%s", source)
         raise HTTPException(status_code=502, detail=f"向量化/入库失败：{e}")
+    # 向量已成功落库，BM25 增量同步失败不应连带否决入库（下次启动 load_from_qdrant 会自愈）
+    try:
+        await bm25.add_chunks(ids, chunks)
+    except Exception:
+        log.exception("BM25 增量更新失败（向量已入库，不影响本次）| 来源=%s", source)
     log.info("知识库入库 | 来源=%s | 抽取字符=%d | 块数=%d", source, len(text), len(chunks))
     return {"ok": True, "source": source, "chars": len(text), "chunks": len(chunks)}
 
@@ -319,9 +408,11 @@ async def ingest_web(body: WebIn, user: dict = Depends(get_current_user)):
 # ---------- 接口 1：闲聊（多轮，有状态，历史存 MySQL）----------
 @app.post("/api/chat")
 async def chat(body: ChatIn, user: dict = Depends(get_current_user)):
-    """闲聊接口（多轮、有状态）：按 session_id 读写 MySQL 会话历史，流式返回模型回复。
+    """闲聊接口（多轮、有状态、支持 Function Calling）：按 session_id 读写 MySQL 会话历史。
 
-    流程：落库用户消息 → 取最近 N 轮历史 → 调模型(stream) → 流结束后回写助手消息。
+    流程：落库用户消息 → 取最近 N 轮历史 → 调模型(stream, 携 tools) → 工具循环若干轮
+    → 流结束后回写助手消息。工具调用过程（assistant/tool 消息）仅存在于本次请求，
+    落库的仍是干净的一问一答，下一轮历史不会超长膨胀。
     会话首次创建时绑定当前用户 uid，历史与会话归属于该用户，不跨用户可见。
     """
     uid = user["uid"]
@@ -332,18 +423,23 @@ async def chat(body: ChatIn, user: dict = Depends(get_current_user)):
     # 2) 取最近 N 轮历史（窗口裁剪已在 DB 层完成）
     history = await load_history(sid, MAX_HISTORY)
     msgs = [{"role": "system", "content": SYSTEM_CHAT}] + history
-    log.info("收到闲聊请求 | sid=%s | 历史条数=%d | 消息=%r", sid, len(history), body.message[:50])
+    # 工具上下文由后端注入（来自 JWT），模型无权伪造 uid/username，防止越权查他人数据
+    ctx = {"uid": uid, "username": user["username"], "sid": sid}
+    log.info("收到闲聊请求 | sid=%s | 历史条数=%d | 工具=%s | 消息=%r",
+             sid, len(history), "on" if ENABLE_TOOLS else "off", body.message[:50])
 
-    # 3) 调模型并把流转成 SSE；异常按类型转成对用户友好的 HTTP 错误
+    # 3) 首轮请求在返回响应头之前建立，模型侧异常仍可按 HTTP 状态码标准返回
+    kwargs = dict(model=CHAT_MODEL, messages=msgs,
+                  temperature=0.7, max_tokens=1024, stream=True)
+    if ENABLE_TOOLS:
+        kwargs["tools"] = TOOL_SCHEMAS
     try:
-        stream = await client.chat.completions.create(
-            model=CHAT_MODEL, messages=msgs,
-            temperature=0.7, max_tokens=1024, stream=True,
-        )
+        stream = await client.chat.completions.create(**kwargs)
         log.info("闲聊模型流已建立，开始返回 | sid=%s | model=%s", sid, CHAT_MODEL)
         return StreamingResponse(
             # 流结束后把完整助手回复回写 MySQL，形成多轮记忆闭环
-            _stream_to_browser(stream, on_complete=lambda full: append_message(sid, "assistant", full, uid)),
+            _chat_sse(stream, msgs, ctx,
+                      on_complete=lambda full: append_message(sid, "assistant", full, uid)),
             media_type="text/event-stream",
             headers={"X-Session-Id": sid},
         )
@@ -362,7 +458,13 @@ async def chat(body: ChatIn, user: dict = Depends(get_current_user)):
 async def ask(body: AskIn, user: dict = Depends(get_current_user)):
     """单轮问答接口，接入 Qdrant RAG：先检索命中资料，再注入 system 提示，并把来源透出给前端。"""
 
-    hits = await retrieve(body.question, k=4, score_threshold=KB_SCORE_THRESHOLD)   # ★ 先检索，元素为含 id/text 的字典
+    # 按检索模式选择通路：hybrid / bm25 / vector（默认 hybrid，异常时回退纯向量）
+    if RETRIEVAL_MODE == "hybrid":
+        hits = await hybrid_retrieve(body.question, k=4, score_threshold=KB_SCORE_THRESHOLD)
+    elif RETRIEVAL_MODE == "bm25":
+        hits = await asyncio.to_thread(bm25.search, body.question, 4)
+    else:
+        hits = await retrieve(body.question, k=4, score_threshold=KB_SCORE_THRESHOLD)
     system = _make_context(hits) if hits else (body.system_prompt or SYSTEM_QA)
     messages = [
         {"role": "system", "content": system},

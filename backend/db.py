@@ -87,3 +87,40 @@ async def get_user_by_username(username: str) -> tuple | None:
             text("SELECT uid, pw_hash FROM users WHERE username=:u"), {"u": username},
         )
         return r.first()
+
+
+# ---------- 工具调用（Function Calling）专用查询 ----------
+async def get_user_profile(uid: int | None = None, username: str | None = None) -> dict | None:
+    """按 uid 或用户名查用户资料，只回非敏感字段（uid/username/created），pw_hash 绝不出 DB 层。"""
+    if uid is None and not username:
+        return None
+    sql = ("SELECT uid, username, created FROM users "
+           + ("WHERE uid=:uid" if uid is not None else "WHERE username=:u"))
+    async with SessionLocal() as s:
+        r = await s.execute(text(sql), {"uid": uid} if uid is not None else {"u": username})
+        row = r.first()
+        if not row:
+            return None
+        return {"uid": row[0], "username": row[1], "created": row[2]}
+
+
+async def search_messages(uid: int, keyword: str, days: int, limit: int) -> list[dict]:
+    """在【指定用户】的全部会话消息里按关键词模糊检索，供 search_chat_history 工具使用。
+
+    安全要点：messages 表没有 uid 列，必须 JOIN sessions 用 s.uid 过滤，绝不可全表 LIKE，
+    否则会搜到其他用户的对话。关键词先转义百分号、下划线、反斜杠再拼 LIKE，避免被当成通配符放大匹配。
+    """
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    async with SessionLocal() as s:
+        r = await s.execute(
+            text("SELECT m.sid, m.role, m.content, m.created FROM messages m "
+                 "JOIN sessions ss ON m.sid = ss.sid "
+                 "WHERE ss.uid=:uid AND m.content LIKE :kw ESCAPE '\\\\' "
+                 "  AND m.created >= NOW() - INTERVAL :days DAY "
+                 "ORDER BY m.id DESC LIMIT :lim"),
+            {"uid": uid, "kw": f"%{escaped}%", "days": days, "lim": limit},
+        )
+        return [
+            {"sid": sid, "role": role, "created": str(created), "content": content[:200]}
+            for sid, role, content, created in r.all()
+        ]
