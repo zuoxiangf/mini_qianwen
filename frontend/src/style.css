@@ -1,0 +1,12 @@
+/* 全局基础样式：Element Plus 组件之外的少量布局补充 */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  background: var(--el-fill-color-light);
+}
