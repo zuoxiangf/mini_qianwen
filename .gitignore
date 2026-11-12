@@ -12,3 +12,8 @@ backend/qdrant_data/
 
 # IDE
 .idea/
+
+# Node / Vite 前端工程
+node_modules/
+frontend/dist/
+frontend/.vite/

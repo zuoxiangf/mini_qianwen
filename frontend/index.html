@@ -4,51 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Mini Qwen</title>
-<link rel="stylesheet" href="style.css" />
 </head>
 <body>
-<!-- 登录/注册门：未登录时全屏遮罩，登录成功后隐藏 -->
-<div id="authGate" class="auth-gate" hidden>
-  <div class="auth-card">
-    <h2>Mini Qwen</h2>
-    <div class="auth-tabs">
-      <button class="auth-tab active" data-auth="login">登录</button>
-      <button class="auth-tab" data-auth="register">注册</button>
-    </div>
-    <form id="authForm" autocomplete="off">
-      <input id="authUser" type="text" placeholder="用户名" autocomplete="username" minlength="3" maxlength="32" required />
-      <input id="authPass" type="password" placeholder="密码（至少 6 位）" autocomplete="current-password" minlength="6" required />
-      <div id="authMsg" class="auth-msg"></div>
-      <button id="authSubmit" type="submit">登录</button>
-    </form>
-  </div>
-</div>
-
-<div class="app" id="app" hidden>
-  <header>
-    <h1>Mini Qwen</h1>
-    <div class="tabs">
-      <button class="tab active" data-mode="chat">💬 闲聊</button>
-      <button class="tab" data-mode="ask">❓ 单轮问答</button>
-    </div>
-    <div class="user-box">
-      <span id="curUser" class="cur-user"></span>
-      <button id="btnLogout" class="ghost" title="退出登录">退出</button>
-    </div>
-    <button id="btnNew" class="ghost">＋ 新对话</button>
-  </header>
-
-  <div id="list" class="list"></div>
-
-  <footer>
-    <textarea id="input" rows="2" placeholder="输入消息…"></textarea>
-    <div class="actions">
-      <span id="hint" class="hint">闲聊模式：会记住上下文</span>
-      <button id="btnSend">发送</button>
-      <button id="btnStop" class="danger" hidden>停止</button>
-    </div>
-  </footer>
-</div>
-<script src="app.js"></script>
+<div id="app"></div>
+<script type="module" src="/src/main.js"></script>
 </body>
 </html>
