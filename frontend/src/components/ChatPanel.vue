@@ -1,4 +1,4 @@
-<!-- 主聊天界面：模式切换（闲聊/单轮问答）、消息列表、SSE 流式接收与停止生成 -->
+<!-- 主聊天界面：左侧历史会话栏（列表/切换/删除） + 模式切换、消息列表、SSE 流式接收与停止生成 -->
 <script setup>
 import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -48,6 +48,86 @@ function newChat() {
   messages.splice(0)
 }
 
+// ---------- 左侧栏：历史会话列表 ----------
+const sessions = ref([])              // [{sid, last_active, title, msg_count}]，按活跃时间倒序
+const sessionsLoading = ref(false)
+const PAGE_SIZE = 50                  // 会话列表每页拉取条数
+
+/** 拉取（或追加）当前用户的历史会话列表 */
+async function loadSessions(append = false) {
+  sessionsLoading.value = true
+  try {
+    const offset = append ? sessions.value.length : 0
+    const res = await fetch(`${API}/api/sessions?limit=${PAGE_SIZE}&offset=${offset}`, {
+      headers: authHeaders(props.token),
+    })
+    if (!res.ok) return
+    const data = await res.json()
+    sessions.value = append ? sessions.value.concat(data.items) : data.items
+  } catch (_) { /* 网络异常：保留旧列表 */ }
+  finally { sessionsLoading.value = false }
+}
+
+/** 打开历史会话：从后端拉取完整消息回放，并切回闲聊模式继续对话 */
+async function openSession(sid) {
+  if (streaming.value) { ElMessage.info('请等待当前回复生成完毕'); return }
+  if (sid === sessionId.value && mode.value === 'chat') return
+  try {
+    const res = await fetch(`${API}/api/session/${sid}/messages`, { headers: authHeaders(props.token) })
+    if (res.status === 401) { ElMessage.warning('登录已过期，请重新登录'); emit('logout'); return }
+    if (!res.ok) { ElMessage.error(extractError(await res.json().catch(() => ({})), res.status)); return }
+    const data = await res.json()
+    mode.value = 'chat'
+    sessionId.value = sid
+    // DB 中 role 为 user/assistant，前端渲染用 user/ai
+    messages.splice(0, messages.length, ...data.items.map((m) => ({
+      role: m.role === 'user' ? 'user' : 'ai', content: m.content, sources: [], tools: [],
+    })))
+    scrollToBottom()
+  } catch (e) {
+    ElMessage.error('加载会话失败：' + e.message)
+  }
+}
+
+/** 删除会话：二次确认后调后端；删的是当前会话时顺便重置为新对话 */
+async function removeSession(item) {
+  try {
+    await ElMessageBox.confirm('确定删除该会话吗？聊天记录不可恢复。', '删除会话',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+  } catch (_) { return }   // 用户取消
+  try {
+    const res = await fetch(`${API}/api/session/${item.sid}`, { method: 'DELETE', headers: authHeaders(props.token) })
+    if (!res.ok && res.status !== 404) {   // 404 视为已删，本地照常移除
+      ElMessage.error(extractError(await res.json().catch(() => ({})), res.status)); return
+    }
+    sessions.value = sessions.value.filter((s) => s.sid !== item.sid)
+    if (sessionId.value === item.sid) newChat()
+    ElMessage.success('已删除会话')
+  } catch (e) {
+    ElMessage.error('删除失败：' + e.message)
+  }
+}
+
+/** 会话标题：优先用首条用户消息摘要，没有则退回 sid 前缀；压缩换行保证单行展示 */
+function sessionTitle(item) {
+  const t = (item.title || '').replace(/\s+/g, ' ').trim()
+  return t || ('会话 ' + item.sid.slice(0, 8))
+}
+
+/** last_active 友好展示：当天显示时分，其余显示月-日 */
+function fmtTime(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (isNaN(d)) return ''
+  if (d.toDateString() === new Date().toDateString()) {
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  }
+  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// 上一页拉满了才可能还有更多，展示“加载更多”入口
+const hasMoreSessions = computed(() => sessions.value.length >= PAGE_SIZE)
+
 async function logout() {
   try {
     await ElMessageBox.confirm('确定退出登录吗？', '提示', { type: 'warning', confirmButtonText: '退出', cancelButtonText: '取消' })
@@ -75,6 +155,7 @@ function toolBrief(tool) {
 async function send() {
   const text = input.value.trim()
   if (!text || streaming.value) return
+  const isChat = mode.value === 'chat'      // 发送后左侧栏是否需刷新会话列表
   input.value = ''
   streaming.value = true
 
@@ -151,6 +232,8 @@ async function send() {
   } finally {
     streaming.value = false
     aborter = null
+    // 闲聊模式下本轮可能新建了会话，或首条消息/活跃时间变了，同步刷新侧栏
+    if (isChat) loadSessions()
     nextTick(() => inputRef.value?.focus())
   }
 }
@@ -160,7 +243,10 @@ function stop() {
   aborter?.abort()
 }
 
-onMounted(() => inputRef.value?.focus())
+onMounted(() => {
+  inputRef.value?.focus()
+  loadSessions()
+})
 </script>
 
 <template>
@@ -175,7 +261,6 @@ onMounted(() => inputRef.value?.focus())
         </el-radio-group>
       </div>
       <div class="header-right">
-        <el-button :icon="'Plus'" plain size="small" :disabled="streaming" @click="newChat">新对话</el-button>
         <el-dropdown trigger="click">
           <span class="user-entry">
             <el-avatar :size="28">{{ props.username[0]?.toUpperCase() }}</el-avatar>
@@ -191,7 +276,37 @@ onMounted(() => inputRef.value?.focus())
       </div>
     </el-header>
 
-    <el-main class="msg-main">
+    <el-container class="body-wrap">
+      <!-- 左侧栏：当前用户的历史会话列表 -->
+      <el-aside width="240px" class="side">
+        <div class="side-head">
+          <el-button type="primary" :icon="'Plus'" class="new-btn" :disabled="streaming" @click="newChat">新对话</el-button>
+        </div>
+        <el-scrollbar class="side-scroll">
+          <div v-loading="sessionsLoading && !sessions.length" class="side-list">
+            <div
+              v-for="s in sessions" :key="s.sid"
+              class="side-item"
+              :class="{ active: mode === 'chat' && s.sid === sessionId }"
+              @click="openSession(s.sid)"
+            >
+              <div class="side-item-main">
+                <div class="side-title">{{ sessionTitle(s) }}</div>
+                <div class="side-meta">{{ fmtTime(s.last_active) }} · {{ s.msg_count }} 条</div>
+              </div>
+              <el-icon class="del-icon" title="删除会话" @click.stop="removeSession(s)"><Delete /></el-icon>
+            </div>
+            <el-text v-if="!sessionsLoading && !sessions.length" type="info" size="small" class="side-empty">
+              还没有历史会话，聊一条试试～
+            </el-text>
+            <div v-if="hasMoreSessions" class="side-more">
+              <el-button link type="primary" size="small" :loading="sessionsLoading" @click="loadSessions(true)">加载更多</el-button>
+            </div>
+          </div>
+        </el-scrollbar>
+      </el-aside>
+
+      <el-main class="msg-main">
       <el-scrollbar ref="scrollbarRef" class="msg-scroll">
         <div class="msg-list">
           <template v-for="(m, i) in messages" :key="i">
@@ -222,7 +337,8 @@ onMounted(() => inputRef.value?.focus())
           <el-empty v-if="!messages.length" description="发一条消息开始对话吧" :image-size="80" />
         </div>
       </el-scrollbar>
-    </el-main>
+      </el-main>
+    </el-container>
 
     <el-footer class="app-footer" height="auto">
       <div class="composer">
@@ -249,7 +365,7 @@ onMounted(() => inputRef.value?.focus())
 <style scoped>
 .chat-app {
   height: 100vh;
-  max-width: 960px;
+  max-width: 1200px;
   margin: 0 auto;
   background: var(--el-bg-color);
   box-shadow: 0 0 12px var(--el-box-shadow-light);
@@ -282,6 +398,84 @@ onMounted(() => inputRef.value?.focus())
 .msg-main {
   padding: 0;
   overflow: hidden;
+}
+/* ---------- 左侧历史会话栏 ---------- */
+.body-wrap {
+  flex: 1;
+  min-height: 0;          /* 关键的嵌套滚动约束，避免侧栏/消息区撞破视口高度 */
+}
+.side {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--el-border-color-light);
+  background: var(--el-fill-color-lighter);
+}
+.side-head {
+  padding: 12px;
+}
+.new-btn {
+  width: 100%;
+}
+.side-scroll {
+  flex: 1;
+  min-height: 0;
+}
+.side-list {
+  padding: 0 8px 12px;
+}
+.side-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.side-item:hover {
+  background: var(--el-fill-color);
+}
+.side-item.active {
+  background: var(--el-color-primary-light-9);
+}
+.side-item.active .side-title {
+  color: var(--el-color-primary);
+  font-weight: 600;
+}
+.side-item-main {
+  flex: 1;
+  min-width: 0;          /* 配合标题省略号生效 */
+}
+.side-title {
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.side-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-top: 2px;
+}
+.del-icon {
+  flex-shrink: 0;
+  visibility: hidden;
+  color: var(--el-text-color-secondary);
+}
+.del-icon:hover {
+  color: var(--el-color-danger);
+}
+.side-item:hover .del-icon {
+  visibility: visible;
+}
+.side-empty {
+  display: block;
+  text-align: center;
+  padding: 16px 0;
+}
+.side-more {
+  text-align: center;
+  padding-top: 6px;
 }
 .msg-scroll {
   height: 100%;

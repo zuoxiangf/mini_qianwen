@@ -20,7 +20,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from db import (                                       # noqa: E402  MySQL 会话/用户读写
     append_message, load_history, clear_session,
-    list_sessions as db_list_sessions, get_session_owner,
+    list_sessions as db_list_sessions, get_session_owner, get_session_messages,
     create_user, get_user_by_username,
 )
 from vector import retrieve, add_docs, hybrid_retrieve            # noqa: E402  向量检索 / 入库 / 混合检索
@@ -496,11 +496,30 @@ async def ask(body: AskIn, user: dict = Depends(get_current_user)):
 # ---------- 会话管理（基于 MySQL sessions 表，仅返回/操作当前登录用户的会话）----------
 @app.get("/api/sessions")
 async def list_sessions(limit: int = 20, offset: int = 0, user: dict = Depends(get_current_user)):
-    """分页返回【当前用户】的会话列表，按最近活跃时间倒序（limit/offset 均有默认值，防全表拉取）。"""
+    """分页返回【当前用户】的会话列表，按最近活跃时间倒序（limit/offset 均有默认值，防全表拉取）。
+    额外返回 title（首条用户消息摘要）与 msg_count，供前端侧栏直接渲染。"""
     rows = await db_list_sessions(user["uid"], limit, offset)
-    items = [{"sid": sid, "last_active": la.isoformat() if la else None} for sid, la in rows]
+    items = [
+        {"sid": sid, "last_active": la.isoformat() if la else None,
+         "title": title, "msg_count": cnt}
+        for sid, la, title, cnt in rows
+    ]
     log.info("查询会话列表 | uid=%d | limit=%d offset=%d | 命中 %d 条", user["uid"], limit, offset, len(items))
     return {"items": items, "limit": limit, "offset": offset}
+
+
+@app.get("/api/session/{sid}/messages")
+async def session_messages(sid: str, user: dict = Depends(get_current_user)):
+    """返回【指定会话】的历史消息（时间正序），先校验会话归属，防越权读取他人聊天记录。"""
+    owner = await get_session_owner(sid)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if owner != user["uid"]:
+        log.warning("越权读取会话历史被拦截 | sid=%s | 归属=%d | 当前=%d", sid, owner, user["uid"])
+        raise HTTPException(status_code=403, detail="无权操作该会话")
+    items = await get_session_messages(sid)
+    log.info("查询会话历史 | sid=%s | uid=%d | 消息条数=%d", sid, user["uid"], len(items))
+    return {"sid": sid, "items": items}
 
 
 @app.delete("/api/session/{sid}")

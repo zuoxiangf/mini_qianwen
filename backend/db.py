@@ -52,14 +52,34 @@ async def clear_session(sid: str):
         await s.commit()
 
 async def list_sessions(uid: int, limit: int, offset: int) -> list[tuple]:
-    """按最近活跃时间倒序分页返回【指定用户】的会话列表 [(sid, last_active), ...]。"""
+    """按最近活跃时间倒序分页返回【指定用户】的会话列表
+    [(sid, last_active, title, msg_count), ...]。
+    title 取会话首条用户消息前 40 字，供前端侧栏做摘要展示；无用户消息时为 NULL。"""
     async with SessionLocal() as s:
         r = await s.execute(
-            text("SELECT sid, last_active FROM sessions WHERE uid=:uid "
-                 "ORDER BY last_active DESC LIMIT :lim OFFSET :off"),
+            text("SELECT s.sid, s.last_active, "
+                 "(SELECT LEFT(m.content, 40) FROM messages m "
+                 "  WHERE m.sid = s.sid AND m.role = 'user' ORDER BY m.id ASC LIMIT 1) AS title, "
+                 "(SELECT COUNT(*) FROM messages m WHERE m.sid = s.sid) AS msg_count "
+                 "FROM sessions s WHERE s.uid=:uid "
+                 "ORDER BY s.last_active DESC LIMIT :lim OFFSET :off"),
             {"uid": uid, "lim": limit, "off": offset},
         )
         return r.all()
+
+async def get_session_messages(sid: str, limit: int = 200) -> list[dict]:
+    """按时间正序返回会话的历史消息（最多最近 limit 条），供前端侧栏切换会话时回放。
+    倒序取 N 条再翻正，与 load_history 同样的窗口裁剪策略。"""
+    async with SessionLocal() as s:
+        r = await s.execute(
+            text("SELECT role, content, created_at FROM messages WHERE sid=:sid "
+                 "ORDER BY id DESC LIMIT :lim"),
+            {"sid": sid, "lim": limit},
+        )
+        rows = [{"role": role, "content": c, "created_at": str(created_at)}
+                for role, c, created_at in r.all()]
+        rows.reverse()
+        return rows
 
 async def get_session_owner(sid: str) -> int | None:
     """返回会话的归属 uid（用于校验会话所有权）；会话不存在返回 None。"""
@@ -113,7 +133,7 @@ async def search_messages(uid: int, keyword: str, days: int, limit: int) -> list
     escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     async with SessionLocal() as s:
         r = await s.execute(
-            text("SELECT m.sid, m.role, m.content, m.created FROM messages m "
+            text("SELECT m.sid, m.role, m.content, m.created_at FROM messages m "
                  "JOIN sessions ss ON m.sid = ss.sid "
                  "WHERE ss.uid=:uid AND m.content LIKE :kw ESCAPE '\\\\' "
                  "  AND m.created >= NOW() - INTERVAL :days DAY "
@@ -121,6 +141,6 @@ async def search_messages(uid: int, keyword: str, days: int, limit: int) -> list
             {"uid": uid, "kw": f"%{escaped}%", "days": days, "lim": limit},
         )
         return [
-            {"sid": sid, "role": role, "created": str(created), "content": content[:200]}
-            for sid, role, content, created in r.all()
+            {"sid": sid, "role": role, "created_at": str(created_at), "content": content[:200]}
+            for sid, role, content, created_at in r.all()
         ]
