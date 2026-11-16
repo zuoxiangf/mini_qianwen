@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS messages (
   sid      VARCHAR(36) NOT NULL,
   role     VARCHAR(16) NOT NULL,
   content  MEDIUMTEXT  NOT NULL,          -- 用 MEDIUMTEXT 避免长回答超 64KB 被截断
-  created  DATETIME    DEFAULT CURRENT_TIMESTAMP,
+  created_at  DATETIME    DEFAULT CURRENT_TIMESTAMP,
   KEY idx_sid_id (sid, id)                 -- 覆盖 WHERE sid=? ORDER BY id DESC LIMIT n
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

@@ -38,8 +38,8 @@ log = logging.getLogger(__name__)
 # ---------- 配置（均来自 .env）----------
 API_KEY = os.environ.get("API_KEY", "")                 # 大模型密钥：仅存在于后端，绝不下发到前端
 BASE_URL = os.environ.get("BASE_URL", "https://maas.qianwenaiapi.com/compatible-mode/v1")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "deepseek-v4-pro-0813")
-QA_MODEL = os.environ.get("QA_MODEL", "deepseek-v4-pro-0813")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen3.7-flash")
+QA_MODEL = os.environ.get("QA_MODEL", "qwen3.7-flash")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "10"))
 # 知识库单文件上传大小上限（MB）
 MAX_UPLOAD_MB = int(os.environ.get("KB_MAX_UPLOAD_MB", "20"))
@@ -58,7 +58,7 @@ MAX_TOOL_ROUNDS = max(1, int(os.environ.get("MAX_TOOL_ROUNDS", "4")))
 
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=90)
 
-SYSTEM_CHAT = """你是千问小助手，一个友好、幽默、乐于助人的 AI 伙伴。
+SYSTEM_CHAT = """你是Mr_Left开发的AI小助手，一个友好、幽默、乐于助人的 AI 伙伴。
 要求：回答简洁自然，像真人聊天；不知道的事直接承认，不编造；
 单次回复尽量控制在 500 字以内，除非用户要求详细展开。
 你可以调用工具获取实时信息：查天气用 get_weather，查账号资料用 get_user_info，

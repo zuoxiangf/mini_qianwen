@@ -188,8 +188,10 @@ async function send() {
       return
     }
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      aiMsg.content = extractError(err, res.status)
+     const err = await res.json().catch(() => ({}))
+      // 原始错误细节只打控制台，页面统一展示友好提示
+      console.error('接口异常 | status=%d |', res.status, err)
+      aiMsg.content = '系统异常，请稍候再试！'
       return
     }
 
@@ -213,7 +215,13 @@ async function send() {
         if (data === '[DONE]') continue         // 流结束标记，无需处理
         try {
           const obj = JSON.parse(data)
-          if (obj.error) { content += `\n[错误] ${obj.error}`; aiMsg.content = content; continue }
+          if (obj.error) {
+            console.error('SSE 错误事件 |', obj.error)
+            // 已生成部分内容时保留并在末尾追加提示，否则整条显示友好提示
+            content += (content ? '\n' : '') + '系统异常，请稍候再试！'
+            aiMsg.content = content
+            continue
+          }
           if (obj.sources) { aiMsg.sources.push(...obj.sources); continue }   // RAG 来源列表，先于正文下发
           if (obj.tool) { aiMsg.tools.push(toolBrief(obj.tool)); continue }   // 工具调用提示（Function Calling）
           if (obj.content) {
@@ -227,7 +235,11 @@ async function send() {
     }
   } catch (e) {
     // 区分用户主动停止（AbortError，保留已生成内容）与真正的网络异常
-    if (e.name !== 'AbortError') aiMsg.content = '网络错误：' + e.message
+      if (e.name !== 'AbortError') {
+      console.error('请求异常 |', e)
+      aiMsg.content = '系统异常，请稍候再试！'
+    }
+
     else aiMsg.content += '\n[已停止]'
   } finally {
     streaming.value = false
