@@ -17,7 +17,7 @@ Mini Qwen 是一个"前端聊天页面 + FastAPI 后端 + 云端大模型"的 AI
 4. **知识库多格式入库**——支持 TXT / PDF / DOCX / HTML 文件上传与网页 URL 抓取，一条流水线：
    抽取纯文本 → 编码嗅探 → 切块 → DashScope 向量化 → 幂等写入 Qdrant；
 5. **闲聊工具调用（Function Calling）**——`/api/chat` 升级为 Agent 循环，模型按需调用
-   内置工具（**查天气 / 查用户资料 / 检索历史对话**），后端解析 `tool_calls`、执行、回喂结果后继续生成；
+   内置工具（**查天气 / 查用户资料 / 检索历史对话 / 城市搜索**），后端解析 `tool_calls`、执行、回喂结果后继续生成；
 6. **生产部署体系**——Docker Compose（MySQL + Qdrant + 后端）+ 宿主机 Nginx（静态站点 + API 反代 + SSE 支持）。
 
 ### 1.1 能力总览
@@ -27,9 +27,10 @@ Mini Qwen 是一个"前端聊天页面 + FastAPI 后端 + 云端大模型"的 AI
 | 注册 / 登录 | bcrypt 哈希密码，签发 HS256 JWT；登录防用户名探测 | `auth.py` + `main.py /api/auth/*` |
 | 多轮闲聊 | 按 `session_id` 读写 **MySQL** 会话历史，流式返回；会话绑定归属用户 | `main.py /api/chat` + `db.py` |
 | 工具调用（Function Calling） | 闲聊时模型按需调用外部工具并回喂结果，形成 Agent 循环；`ENABLE_TOOLS` 一键开关 | `main.py /api/chat` + `tools.py` |
-| ├ 查天气 | Open-Meteo 免费接口（免 Key、支持中文城市名），返回实况 + 逐日预报 | `tools.py get_weather` |
+| ├ 查天气 | 和风天气（QWeather）每日预报 + 实时实况，内部先经 GeoAPI 定位坐标 | `tools.py get_weather` |
 | ├ 查用户 | 查 users 表资料（留空查自己），只回非敏感字段 | `tools.py get_user_info` + `db.py get_user_profile()` |
-| └ 查历史对话 | 按关键词 JOIN sessions 过滤当前用户，LIKE 检索过往消息 | `tools.py search_chat_history` + `db.py search_messages()` |
+| ├ 查历史对话 | 按关键词 JOIN sessions 过滤当前用户，LIKE 检索过往消息 | `tools.py search_chat_history` + `db.py search_messages()` |
+| └ 城市搜索 | 和风 GeoAPI 按地名/LocationID/坐标查城市，返回 LocationID、经纬度、时区、区划 | `tools.py city_lookup` |
 | 单轮问答 + RAG | 检索命中资料注入 system 提示，`sources` 事件先于正文下发 | `main.py /api/ask` + `vector.py retrieve()/hybrid_retrieve()` |
 | 混合检索 | 向量(Qdrant) + 关键字(BM25/jieba) 双路，RRF 融合排序，`RETRIEVAL_MODE` 切换 | `vector.py hybrid_retrieve()` + `bm25.py` |
 | 知识库入库 | 多格式文件 → 抽取文本 → 切块 → 向量化 → 幂等写 Qdrant；空文本显式 422 拒绝 | `main.py /api/kb/upload` + `extract.py` + `vector.py add_docs()` |
@@ -50,8 +51,8 @@ graph TB
     N -->|反代 /api/ 透传鉴权头| B[FastAPI 后端<br/>main.py]
     B -->|"Depends(get_current_user)"| AU[auth.py<br/>JWT / bcrypt]
     B -->|OpenAI 兼容协议 stream=True| C[云端聊天模型<br/>BASE_URL 网关]
-    B -->|解析 tool_calls / 回喂结果| TL[tools.py<br/>天气·查用户·查历史]
-    TL -->|Open-Meteo HTTP| WX[天气接口]
+    B -->|解析 tool_calls / 回喂结果| TL[tools.py<br/>天气·查用户·查历史·城市搜索]
+    TL -->|和风天气 HTTP<br/>GeoAPI 定位 + 预报/实况| WX[QWeather API]
     TL -->|get_user_profile / search_messages| D
     B -->|消息 / 会话 / 用户读写| D[(MySQL<br/>messages / sessions / users)]
     B -->|文件 / URL| EX[extract.py<br/>PDF·DOCX·HTML·编码嗅探]
@@ -85,7 +86,7 @@ mini_qianwen/
 ├── backend/
 │   ├── main.py        # FastAPI 接口层：鉴权 / chat（含工具循环）/ ask / kb 上传·网页·状态 / 会话管理
 │   ├── auth.py        # 鉴权基础设施：bcrypt 哈希、JWT 签发/校验、get_current_user 依赖
-│   ├── tools.py       # Function Calling 工具层：天气 / 查用户 / 检索历史对话的 schema 与实现
+│   ├── tools.py       # Function Calling 工具层：天气 / 城市搜索 / 查用户 / 检索历史对话的 schema 与实现
 │   ├── db.py          # MySQL 存储层：消息、会话（含归属 uid）、用户表读写 + 工具专用查询
 │   ├── vector.py      # 向量层：Qdrant 客户端管理 + DashScope Embedding + add_docs / retrieve / hybrid_retrieve
 │   ├── bm25.py        # 关键字层：jieba 分词 + 进程内 BM25 索引（复用 vector 客户端，供混合检索）
@@ -248,13 +249,27 @@ mini_qianwen/
 - **`TOOL_SCHEMAS`**：OpenAI `chat.completions.tools` 格式的工具声明（name / description / parameters JSON Schema），
   直接传给模型；模型据此判断“要不要调用、调用哪个、传什么参数”；
 - **`execute_tool(name, arguments, ctx)`**：统一分发入口，根据模型给出的工具名路由到具体实现；
-- 三个工具实现：
+- 四个工具实现：
 
 | 工具 | 作用 | 数据源 | 关键约定 |
 |---|---|---|---|
-| `get_weather(city, days?)` | 查当前天气 + 逐日预报 | Open-Meteo（地理编码 + 预报两个 HTTP 接口，免 Key） | 城市名先解析成坐标；WMO 天气码经 `WMO_CODES` 字典翻译成中文 |
+| `get_weather(city, days?)` | 查实时天气 + 逐日预报（1~10 天） | 和风天气 QWeather：先 GeoAPI 定位坐标，再查 `/weather/v1/daily` 预报 + `/weather/v1/current` 实况 | 城市名先解析成坐标（取 Top3 回喂重名候选引导消歧）；入参为“经度,纬度”时跳过定位省配额；实况失败走降级不中断预报 |
+| `city_lookup(location, ...)` | 城市/地点搜索，返回 LocationID、经纬度、时区、上级区划 | 和风天气 GeoAPI `/geo/v2/city/lookup` | 与 `get_weather` 共用凭据；`region` 对外查询 key 仍叫 `range`（避免遮蔽内置名）；无结果/异常转 JSON 不抛出 |
 | `get_user_info(username?)` | 查账号资料（uid/用户名/注册时间） | `db.get_user_profile()` | 留空查自己；**只回非敏感三字段，`pw_hash` 绝不出 DB 层** |
 | `search_chat_history(keyword, days?, limit?)` | 跨会话检索历史对话 | `db.search_messages()` | 按关键词 LIKE；`days/limit` 夹到安全区间 |
+
+**和风天气认证与容错（新增）**：
+
+- **认证二选一**（绝不同时发两个头，否则和风判认证冲突）：优先 `X-QW-Api-Key`（`QWEATHER_API_KEY`），
+  仅配 `QWEATHER_JWT` 时改用 `Authorization: Bearer`；`QWEATHER_GEO_HOST` 为控制台分配的专属域名（不带 `https://`）；
+- **请求日志优化**：`_qx_get` 统一封装——记录接口路径 + 查询参数（绝不打印认证头，防 Key 泄露进日志）；
+  非 2xx 时额外记录**完整请求 URL + 响应体**（和风的错误详情在 body 中），便于定位 401/403 一类联调问题；
+- **错误码翻译**：HTTP 错误经 `_http_error_hint` 翻译成可操作中文（401=认证冲突、403=未订阅该产品/安全限制、402=配额、429=限频）回喂模型。
+
+> ⚠️ **当前临时降级**：和风 GeoAPI（城市搜索）返回 **403 Security Restriction**——控制台项目配了 IP 白名单/安全限制未放行本机出口 IP。
+> 为不阻塞天气主链路，`tools.py` 顶部临时用常量 `FIXED_LATLON`/`FIXED_CITY_NAME` 固定坐标（当前=上海），
+> `get_weather` 直接使用该坐标、**跳过 GeoAPI 定位**。待控制台放开安全限制后，把 `FIXED_LATLON` 置 `None` 即恢复正常按城市名查询。
+> 此期间无论用户问哪个城市都会返回固定坐标的天气，`city_lookup` 工具仍依赖 GeoAPI（同样受 403 限制）。
 
 **安全与健壮性设计**（工具体现在哪都不抛异常、不抢权限）：
 
@@ -293,6 +308,9 @@ mini_qianwen/
 | `RETRIEVAL_MODE` | 检索通路开关 | `hybrid`（默认，向量+BM25 RRF 融合）/ `vector` / `bm25`；改后需重启后端生效 |
 | `ENABLE_TOOLS` | 闲聊工具调用（Function Calling）开关 | 默认 `1`；置 `0` 一键回退纯闲聊（网关/模型不支持 tools 时用） |
 | `MAX_TOOL_ROUNDS` | 单次对话最多允许几轮工具调用 | 默认 4；末轮去掉 tools 强制文字收尾防死循环 |
+| `QWEATHER_API_KEY` | 和风天气 API Key | 请求头 `X-QW-Api-Key` 发送；与 `QWEATHER_JWT` 二选一，优先此项 |
+| `QWEATHER_JWT` | 和风天气 JWT（可选） | 仅留空 `QWEATHER_API_KEY` 时启用 `Authorization: Bearer`；切勿同时填 |
+| `QWEATHER_GEO_HOST` | 和风天气专属 API Host | 控制台「项目管理」分配，仅域名不带 `https://`；`get_weather`/`city_lookup` 必填 |
 
 完整模板见 `.env.prod.example`（复制为 `.env.prod` 填写，**绝不进 git**）。
 
@@ -474,7 +492,7 @@ python main.py         # 日志出现"服务启动 | CHAT=... QA=..."即成功
    登录前端后切到**闲聊模式**（`/api/chat`，非问答模式），逐句验证：
 
    - **查天气**：问“北京今天天气怎么样？” → AI 气泡顶部先出现“🌤️ 正在查天气 · 北京”提示行，
-     随后流式输出实况温度与预报（能拿到真实数据即说明 Open-Meteo 通路打通，需容器/本机可访问外网）；
+     随后流式输出实况温度与预报（能拿到真实数据即说明和风天气通路打通，需容器/本机可访问外网且已订阅产品）；
    - **查用户**：问“我的账号是什么时候注册的？” → 出现“👤 正在查用户信息”，回答含注册时间（取自 users 表）；
    - **查历史**：先聊几句植入一个关键词（如“我叫小明”），新开会话再问“我之前说过什么名字？”
      → 出现“🔍 正在检索历史对话”并命中旧消息；
@@ -567,8 +585,8 @@ python main.py         # 日志出现"服务启动 | CHAT=... QA=..."即成功
       下发"⚡ 正在使用技能：xx"事件复用 `/api/chat` 现有的 `{tool}` 事件机制，前端几乎不改；
     - 配合第 11 条 Prompt 管理一起做：技能本质上是版本化的提示词资产。
 18. **MCP（Model Context Protocol）**：把工具从"代码里写死"变成"协议化插拔"，双向接入：
-    - **对内：backend 兼作 MCP Server**——用 FastMCP SDK 把 `tools.py` 三个工具
-      （get_weather / get_user_info / search_chat_history）暴露为标准 MCP 服务，Claude Desktop、
+    - **对内：backend 兼作 MCP Server**——用 FastMCP SDK 把 `tools.py` 四个工具
+      （get_weather / city_lookup / get_user_info / search_chat_history）暴露为标准 MCP 服务，Claude Desktop、
       Qoder 等任意 MCP 客户端可复用同一套能力，与 HTTP 接口并存互不影响；
     - **对外：backend 作 MCP Client**——新增 `mcp_registry.py`，启动时连接 `.env` 配置的若干
       MCP Server（`mcp_servers.json`），把远端 `tools/list` 动态转成 `TOOL_SCHEMAS` 附加进模型请求，

@@ -35,4 +35,5 @@ export const TOOL_LABELS = {
   get_weather: '🌤️ 正在查天气',
   get_user_info: '👤 正在查用户信息',
   search_chat_history: '🔍 正在检索历史对话',
+  city_lookup: '📍 正在搜索城市',
 }
